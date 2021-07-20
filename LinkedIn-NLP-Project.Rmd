@@ -1,0 +1,411 @@
+---
+title: "LinkedIn NLP"
+output: html_document
+---
+
+# 1. Read in Libraries and Data 
+
+```{r message=FALSE, warning=FALSE}
+library(tidyverse)
+library(cowplot)
+library(tidymodels)
+library(skimr)
+library(tidytext)
+library(fixest)
+library(corrplot)
+options(scipen = 999)
+```
+
+```{r message=FALSE, warning=FALSE}
+linkedin_posts <- read_csv("LinkedIn_Posts.csv")
+```
+
+# 2(A). Evaluate and Clean Data 
+
+```{r message=FALSE, warning=FALSE}
+skim(linkedin_posts) # evaluate data 
+```
+
+## 2(B). Change Data Structure 
+
+```{r}
+linkedin_posts <- linkedin_posts %>% 
+  mutate(Date = as.Date(publication_date, format = "%m/%d/%Y")) %>% 
+  select(-publication_date)
+```
+
+## 2(C). Deal with strange symbols in strings
+
+```{r}
+replace_reg <- "https?://[^\\s]+|&amp;|&lt;|&gt;|\bRT\\b" # use to filter out URL'S
+```
+
+```{r}
+linkedin_posts <- linkedin_posts %>% 
+  mutate(Post_Text = str_remove_all(Post_Text, "[â€™ðŸ“¢¥œ†•°Ã©Â]"),
+         Post_Text = str_replace_all(Post_Text, replace_reg, "")) 
+```
+
+## 2(D). Categorize Missing Values 
+
+```{r}
+linkedin_posts <- linkedin_posts %>% 
+  mutate(Post_Text = ifelse(Post_Text == "NULL" | 
+                            Post_Text == "null", 
+                            NA, 
+                            Post_Text))
+```
+
+## 2(E). Deal with Missing Values 
+
+```{r}
+sum(is.na(linkedin_posts)) # count missing values 
+```
+
+```{r}
+linkedin_posts <- na.omit(linkedin_posts) # remove missing values 
+```
+
+# 3. Feature Engineering
+
+## 3(A). ID 
+
+```{r}
+linkedin_posts <- linkedin_posts %>% 
+  mutate(Id = row_number())
+```
+
+## 3(A). User Engagement
+
+```{r}
+linkedin_posts <- linkedin_posts %>%
+  mutate(User_Engagement = Impressions + Engagements + Reactions + Shares)
+```
+
+## 3(B). Tokenization of LinkedIn Posts (Individual Words)
+
+```{r message=FALSE, warning=FALSE}
+words <- linkedin_posts %>% 
+  unnest_tokens(word, Post_Text, token = "tweets") 
+```
+
+```{r}
+words <- words %>%
+  anti_join(stop_words, by = "word") # remove words that contain stop words 
+```
+
+## 3(C). Tokenization of LinkedIn Posts (Word Pairs)
+
+```{r}
+bigrams <- linkedin_posts %>%
+  unnest_tokens(bigram, Post_Text, token = "ngrams", n = 2) 
+```
+
+```{r}
+bigrams <- bigrams %>%
+  separate(bigram, into = c("first","second"), sep = " ", remove = FALSE) %>%
+  anti_join(stop_words, by = c("first" = "word")) %>%
+  anti_join(stop_words, by = c("second" = "word")) %>%
+  filter(str_detect(first, "[a-z]") &
+         str_detect(second, "[a-z]")) # remove word pairs that contains stop words 
+```
+
+## 3(D). Count of Negative and Positive Sentiments Per Post 
+
+```{r}
+bing <- get_sentiments("bing") # pull in sentiment classifier 
+```
+
+```{r}
+sentiments <- inner_join(words, bing, by = "word") 
+```
+
+```{r}
+count_pos <- sentiments %>% 
+  filter(sentiment == "positive") %>% 
+  group_by(Id) %>% 
+  count() %>% 
+  rename("Positive_Sentiments" = "n")
+
+count_neg <- sentiments %>% 
+  filter(sentiment == "negative") %>% 
+  group_by(Id) %>% 
+  count() %>% 
+  rename("Negative_Sentiments" = "n")
+
+linkedin_posts <- left_join(linkedin_posts, count_pos, by = "Id")
+linkedin_posts <- left_join(linkedin_posts, count_neg, by = "Id")
+linkedin_posts <- linkedin_posts %>% 
+  mutate(Positive_Sentiments = ifelse(is.na(Positive_Sentiments), 0, Positive_Sentiments),
+         Negative_Sentiments = ifelse(is.na(Negative_Sentiments), 0, Negative_Sentiments),
+         Total_Sentiments = Positive_Sentiments + Negative_Sentiments) 
+
+```
+
+
+## 3(E). Create Hashtag Variable 
+```{r}
+hashtags <- words %>%
+  filter(grepl("#",word) & word != "#") %>% 
+  mutate(word = gsub("'s","", word)) 
+  
+hashtags_group <- hashtags %>%   
+  group_by(Id) %>% 
+  count() %>% 
+  rename("Hashtags" = "n")
+
+linkedin_posts <- left_join(linkedin_posts, hashtags_group, by = "Id")
+linkedin_posts <- linkedin_posts %>% 
+  mutate(Hashtags = ifelse(is.na(Hashtags), 0, Hashtags))
+```
+
+## 3(F). Year, Month, Day, Day of Week
+
+```{r}
+linkedin_posts <- linkedin_posts %>%
+  mutate(Year = format(Date, "20%y"),
+         Month = format(Date, "%m"),
+         Day = format(Date, "%d"),
+         Weekday = format(Date, "%A"))
+```
+
+
+# 4. Exploratory Data Analysis  
+
+```{r}
+words_count <- words %>%
+  group_by(word) %>%
+  count()
+
+top_words <- words_count %>%
+  filter(n > 200)
+
+```
+
+```{r}
+ggplot(top_words, aes(x=word, y= n)) +
+  geom_segment( aes(x= word, xend= word, y=0, yend = n), color="grey") +
+  geom_point( color="orange", size=4) +
+  theme_light() +
+  theme(
+    panel.grid.major.x = element_blank(),
+    panel.border = element_blank(),
+    axis.ticks.x = element_blank()
+  ) +
+  xlab("") +
+  ylab("Frequency") + 
+  ggtitle("Top 10 Most Frequently Used Words")
+```
+
+```{r}
+bigrams_count <- bigrams %>%
+  group_by(bigram) %>%
+  count()
+
+bigrams_count %>%
+  arrange(-n)
+```
+
+## Sentiment Analysis 
+
+```{r}
+sentiments_counts <- sentiments %>%
+  count(sentiment) %>%
+  arrange(-n)
+
+sentiments_counts # positive sentiment is utilized more than negative sentiment
+```
+
+```{r}
+sentiments %>% 
+  group_by(sentiment) %>%
+  summarise(mean = mean(User_Engagement)) %>%
+  ggplot() +
+  geom_bar(mapping = aes(x = sentiment, y = mean), stat = "identity", fill = "#97D7E3") +
+  theme_cowplot(12)  # slightly more user engagement with positives sentiment laced posts than negative sentiment laced posts 
+```
+
+
+### Positive Vs. Negative Laced Strings? 
+```{r}
+neg_sentiment <- sentiments %>% 
+  filter(sentiment == "negative")
+
+pos_sentiment <- sentiments %>% 
+  filter(sentiment == "positive")
+
+t.test(neg_sentiment$User_Engagement, pos_sentiment$User_Engagement) # no statistically significant difference between positive and negative sentiment laced strings 
+```
+### Hashtag Frequency 
+```{r}
+hashtags_count <- words %>%
+  filter(grepl("#",word) & word != "#") %>% # clean possessives
+  mutate(word = gsub("'s","", word)) %>%
+  count(word) %>%
+  arrange(-n)
+
+hashtags_count
+```
+
+```{r}
+hashtags_count %>% 
+  filter(n > 9) %>% 
+  ggplot(aes(x=word, y=n)) +
+  geom_segment(aes(x=word, xend=word, y=0, yend=n), color="skyblue") +
+  geom_point( color="blue", size=4, alpha=0.6) +
+  theme_light() +
+  coord_flip() +
+  theme(
+    panel.grid.major.y = element_blank(),
+    panel.border = element_blank(),
+    axis.ticks.y = element_blank()) + 
+  xlab("") +
+  ylab("Frequency") + 
+  ggtitle("Top 10 Most Frequently Used Hashtags")
+```
+
+
+## Audience Reaction Analysis
+
+```{r}
+linkedin_posts %>% 
+ggplot() +
+  geom_histogram(mapping = aes(x = Impressions), bins = 20, color = "white", fill = "#97D7E3") +
+  theme_cowplot(12) 
+```
+
+```{r}
+linkedin_posts %>% 
+ggplot() +
+  geom_histogram(mapping = aes(x = Engagements), bins = 20, color = "white", fill = "#97D7E3") +
+  theme_cowplot(12) 
+```
+
+```{r}
+linkedin_posts %>% 
+ggplot() +
+  geom_histogram(mapping = aes(x = Reactions), bins = 20, color = "white", fill = "#97D7E3") +
+  theme_cowplot(12) 
+```
+
+```{r}
+linkedin_posts %>% 
+ggplot() +
+  geom_histogram(mapping = aes(x = Shares), bins = 20, color = "white", fill = "#97D7E3") +
+  theme_cowplot(12) 
+```
+
+```{r}
+linkedin_posts %>% 
+ggplot() +
+  geom_histogram(mapping = aes(x = User_Engagement), bins = 20, color = "white", fill = "#97D7E3") +
+  theme_cowplot(12) 
+```
+
+### Log User Engagement to Approach Normal Distribution 
+```{r}
+linkedin_posts %>% 
+ggplot() +
+  geom_histogram(mapping = aes(x = log(User_Engagement)), bins = 20, color = "white", fill = "#97D7E3") +
+  theme_cowplot(12) # log user engagement to get normal distribution 
+```
+
+
+## Outlier Analysis 
+
+```{r}
+linkedin_posts %>% 
+  filter(User_Engagement > 10000) # the main outlier was a post about Raphael Bostic becoming the next FRB Atlanta President 
+```
+
+## User Engagement Analysis 
+
+```{r}
+user_engage <- linkedin_posts %>% 
+  select(Impressions, Engagements, Reactions, Shares) 
+
+  
+corrplot(cor(user_engage), method = "color", order = "alphabet") # reactions and engagements are highly correlated 
+```
+
+## Time Series Analysis
+
+```{r}
+linkedin_posts %>% 
+  ggplot() +
+  geom_line(mapping = aes(x = Date, y = User_Engagement)) +
+  theme_cowplot(12) +
+  ylab("User Engagement") +
+  xlab("Date") +
+  ggtitle("Daily User Engagement Over Time")
+```
+
+```{r}
+linkedin_posts %>% 
+  group_by(Month) %>%
+  summarise(mean = mean(User_Engagement)) %>%
+  ggplot() +
+  geom_bar(mapping = aes(x = Month, y = mean), stat = "identity", fill = "#97D7E3") +
+  theme_cowplot(12) +
+  ylab("User Engagement") +
+  xlab("Month of the Year") +
+  ggtitle("Average User Engagement By Month")
+```
+
+```{r}
+linkedin_posts %>% 
+  group_by(Weekday) %>%
+  summarise(mean = mean(User_Engagement)) %>%
+  ggplot() +
+  geom_bar(mapping = aes(x = Weekday, y = mean), stat = "identity", fill = "#97D7E3") +
+  theme_cowplot(12) + 
+  ylab("User Engagement") +
+  xlab("Day of the Week") +
+  ggtitle("Average User Engagement By Weekday")
+```
+
+
+# 5. Modeling
+
+## 5(A). Linear Regression to Determine Optimal Posting Day
+```{r}
+weekday_model <- feols(log(User_Engagement) ~ Weekday + Total_Sentiments + Positive_Sentiments + Negative_Sentiments + Hashtags | Year + Month + Day,
+                       data = linkedin_posts)
+
+tidy(weekday_model) # Monday posts return highest user engagements
+```
+
+## 5(B). Linear Regressions to Examine Relationship Between Sentiment and User Engagement
+```{r}
+sentiment_model <- feols(log(User_Engagement) ~ Total_Sentiments + Hashtags | Year + Month + Day + Weekday,
+                       data = linkedin_posts)
+
+tidy(sentiment_model) # More Positive and Negative Sentiments increase user engagement, significant at 5% level 
+```
+```{r}
+pos_sentiment_model <- feols(log(User_Engagement) ~ Positive_Sentiments + Hashtags | Year + Month + Day + Weekday,
+                       data = linkedin_posts)
+
+tidy(pos_sentiment_model) # Positive sentiments increase user engagement, significant at the 1% level 
+```
+
+```{r}
+neg_sentiment_model <- feols(log(User_Engagement) ~ Negative_Sentiments + Hashtags | Year + Month + Day + Weekday,
+                       data = linkedin_posts)
+
+tidy(neg_sentiment_model) # Additional negative sentiments do not increase user engagement statistically 
+```
+
+```{r}
+hashtag_model <- feols(log(User_Engagement) ~ Hashtags | Year + Month + Day + Weekday, 
+                       data = linkedin_posts)
+
+tidy(hashtag_model) # additional hashtags not statistically significant 
+```
+
+# Write CSV 
+
+```{r}
+write_csv(linkedin_posts, file = "Cleaned_Linkedin_Posts.csv")
+```
+
